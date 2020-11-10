@@ -1,0 +1,181 @@
+---
+title: "Example: Airbnb in London"
+output: html_notebook
+---
+
+First, we load the useful packages. 
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggmap)
+library(lfe)
+library(skimr)
+library(here)
+```
+
+# 1. Downloading the data 
+
+We go and download the data where it is, on the InsideAirbnb website. We choose to download the data from September 2020 for London. 
+```{r}
+## Requires internet connection
+download.file(
+  "http://data.insideairbnb.com/united-kingdom/england/london/2020-09-11/data/listings.csv.gz",
+  here("airbnb","data","input","listings.csv.gz"))
+
+download.file(
+  "http://data.insideairbnb.com/united-kingdom/england/london/2020-09-11/data/calendar.csv.gz",
+  here("airbnb","data","input","calendar.csv.gz"))
+
+download.file(
+  "http://data.insideairbnb.com/united-kingdom/england/london/2020-09-11/data/reviews.csv.gz",
+  here("airbnb","data","input","reviews.csv.gz"))
+
+download.file(
+  "http://data.insideairbnb.com/united-kingdom/england/london/2020-09-11/visualisations/neighbourhoods.geojson",
+  here("airbnb","data","input","neighbourhoods.geojson"))
+```
+
+Now that we have downloaded the data, we open the different files and store them into R objects. Note that we do not need to unzip the files, it is done on the fly. 
+```{r, include=FALSE}
+listdb <- read_csv(here("airbnb","data","input","listings.csv.gz"))
+caldb <- read_csv(here("airbnb","data","input","calendar.csv.gz"))
+revdb <- read_csv(here("airbnb","data","input","reviews.csv.gz"))
+neighdb <- geojsonsf::geojson_sf(here("airbnb","data","input","neighbourhoods.geojson"))
+```
+
+Let's see what these datasets look like. 
+- Listings: shows characteristics and price posted by 77,591 listings in September 2020 in London. Of particular interest is precise location, descriptions, and number of reviews
+- Calendar: shows for each date in the calendar and each listing (28 million observations) if the day is available, how much it costs, and the number of bookable nights
+- Reviews: 1.2 million reviews available for these listings. 
+- Neighbourhoods: this is a geographic dataset with the contours of London boroughs.
+```{r}
+listdb %>% glimpse
+caldb %>% glimpse
+revdb %>% glimpse
+neighdb %>% glimpse
+```
+
+# 2. Mapping the data
+
+Let's map the neighbourhoods. Yes, it looks like London, indeed. 
+```{r}
+neighdb %>% ggplot() + geom_sf()
+```
+
+Let's now put the listings on top of the previous map. We make each point somehow transparent (alpha = .01) to have a better idea of the areas where listings are mostly located. The map confirms that listings are in central London, not much in the periphery of London. 
+```{r}
+listsf <- listdb %>% sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+ggplot(listsf) + 
+  geom_sf(data = neighdb) + 
+  geom_sf(alpha=.01, inherit.aes =FALSE) 
+```
+
+Let's now zoom in on Central London. This map is clearer indeed. One can guess parks and areas more sparsely populated. Guessing is one thing, but can we do better? 
+```{r}
+ggplot(listsf) + 
+  geom_sf(data = neighdb) + 
+  geom_sf(alpha=.05, inherit.aes =FALSE) + 
+  coord_sf(xlim=c(-.2,0),ylim=c(51.47,51.57))
+```
+
+Yes, we can. Let's download Stamen fancy background maps, to show more clearly the details of the map. Now, we see clearly each park and that the City and Canary Wharf do not contain many listings. 
+```{r}
+ctrldn_map <- get_stamenmap(bbox = c(left = -.2, bottom = 51.47, right = 0, top = 51.57),
+                            zoom=13,maptype = "toner")
+
+ggmap(ctrldn_map) + 
+  geom_sf(alpha=.05, colour="darkgreen", data=listsf, inherit.aes =FALSE)
+ggsave(here("airbnb","data","output","map_centrelondon_densityairbnb.png"))
+```
+
+# 3. Amenities
+
+An interesting pattern of the data is that we know all the amenities that hosts are listing about their properties. There are hundreds of them and they might be important to understand how hosts price their properties. The problem is that they are stored in a strange manner, as juxtapositions like `{amenity1, amenity2, amenity3}`, which differs for all listings. 
+
+What we first need to do is unpack the list of amenities and keep the ones that appear enough times (we take a threshold of 200). 
+```{r}
+amen_unpacked <- listdb %>% pull(amenities) %>% 
+  str_remove("\\[\\\"")  %>% str_remove("\\\"\\]") %>% 
+  str_remove("\\[\\]") %>% 
+  str_replace_all("\\\", \\\"",",") %>% str_split(",") %>% 
+  map(~ .x %>% 
+    str_replace_all("[^A-Za-z0-9]","_") %>%
+    str_to_lower() %>% 
+    str_remove("u2019"))
+
+list_amen <- tibble(amen = do.call("c", amen_unpacked)) %>% 
+  count(amen) %>% filter(n>200, amen!="") %>% pull(amen) 
+```
+
+The object `list_amen` that we have created contains 90 amenities that are frequently used. Now, we create a dataset with the same number of observations as the number of listings, with dummy variables for each amenity. 
+```{r}
+amen_dummy_fun <- function(amenity) {
+  amen_unpacked %>% 
+    map_lgl(function(vv){any(amenity==vv)})
+  }
+
+listdb2 <- list_amen %>% 
+  map(amen_dummy_fun) %>% 
+  set_names(list_amen) %>% 
+  as_tibble() 
+listdb2 %>% glimpse
+```
+
+Now let's turn to the property_type variable, it has way too many values, we'll need to simplify it a bit. We do that below. 
+```{r}
+listdb %>% count(property_type) %>% arrange(desc(n))
+```
+
+What about the neighbourhood and neighbourhood_cleansed variables. What do they look like? 
+```{r}
+listdb %>% count(neighbourhood) %>% arrange(desc(n))
+listdb %>% count(neighbourhood_cleansed) %>% arrange(desc(n))
+```
+
+Bad news: the bathrooms variable seems to be empty. There is a `bathrooms_text` variable however, and it looks alright. Let's recode it to use it. 
+```{r}
+listdb %>% select(bathrooms) %>% skim()
+listdb %>% count(bathrooms_text) %>% arrange(desc(n))
+listdb <- listdb %>% 
+  mutate(bathroom_shared = str_detect(bathrooms_text,"shared"), 
+         bathroom_private = str_detect(bathrooms_text,"private"), 
+         bathroom_number = bathrooms_text %>% str_remove_all("[^0-9\\.]") %>% as.numeric()
+         )
+```
+
+
+Based on the ground work above, we build the regression dataset, where we clean a few variables, add the dummy variables for amenities, and remove zero-price observations. 
+```{r}
+regdb <- listdb %>% 
+  mutate(price = price %>% str_sub(2,-1) %>% str_remove_all(",") %>% as.numeric(), 
+         log_price = log(price), 
+         property_type = ifelse(property_type %in% c("Entire apartment","Private room in apartment","Private room in house","Entire house"),property_type,"Other")) %>% 
+  select(id, log_price, property_type, room_type, 
+         accommodates, bedrooms, beds,neighbourhood, 
+         bathroom_shared, bathroom_private, bathroom_number) %>% 
+  bind_cols(listdb2) %>%
+  filter(is.finite(log_price)) 
+```
+
+Now, we run the regressions. We have three specifications: 
+- A simple one with just a few variables, 
+- A more involved one with amenities, 
+- The biggest one with amenities and neighbourhood fixed effects. 
+```{r}
+price_formula <- formula("log_price ~ property_type + room_type + accommodates + bathroom_shared + bathroom_private + bathroom_number + bedrooms + beds ")
+
+price_formula_big <- paste0("log_price ~ property_type + room_type + accommodates + bathroom_shared + bathroom_private + bathroom_number + bedrooms + beds +", 
+                        paste(list_amen, collapse= " + ")) %>% formula()
+
+price_formula_big_neigh <- paste0("log_price ~ property_type + room_type + accommodates + bathroom_shared + bathroom_private + bathroom_number + bedrooms + beds +", 
+                        paste(list_amen, collapse= " + "), "| neighbourhood") %>% formula()
+
+res <- felm(price_formula, regdb)
+res %>% summary
+resb <- felm(price_formula_big, regdb)
+resb %>% summary
+resbf <- felm(price_formula_big_neigh, regdb)
+resbf %>% summary
+```
+
+Interestingly, this leaves us with several specifications. The biggest one explains a larger part of the variance ($R^2$ is high), but that comes at the high cost regarding the lack of parsimony. Model selection method would be useful to help sort out which is the "best" one (and for what). 
